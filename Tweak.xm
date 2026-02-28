@@ -1,19 +1,43 @@
+#import <CoreMedia/CoreMedia.h>
+#import <Foundation/NSProcessInfo.h>
+#import <Foundation/NSString.h>
+#import <HBLog.h>
 #import <substrate.h>
+#ifdef SIDELOAD
+#import <libundirect/libundirect_dynamic.h>
+#else
+#import <libundirect/libundirect.h>
+#endif
 #import <sys/sysctl.h>
 #import <version.h>
 #import "Header.h"
 
+typedef struct {
+    const unsigned int *data;
+    uint64_t length;
+} Span;
+
 extern "C" {
-    BOOL UseVP9orAV1();
+    BOOL UseVP9();
     BOOL AllVP9();
+    BOOL DisableServerABR();
     int DecodeThreads();
     BOOL SkipLoopFilter();
     BOOL LoopFilterOptimization();
     BOOL RowThreading();
 }
 
+// Remove any <= 1080p VP9 formats if AllVP9 is disabled
 NSArray <MLFormat *> *filteredFormats(NSArray <MLFormat *> *formats) {
-    return formats;
+    if (AllVP9()) return formats;
+    NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(MLFormat *format, NSDictionary *bindings) {
+        if (![format isKindOfClass:%c(MLFormat)]) return YES;
+        NSString *qualityLabel = [format qualityLabel];
+        BOOL isHighRes = [qualityLabel hasPrefix:@"2160p"] || [qualityLabel hasPrefix:@"1440p"];
+        BOOL isVP9orAV1 = [[format MIMEType] videoCodec] == 'vp09' || [[format MIMEType] videoCodec] == 'av01';
+        return (isHighRes && isVP9orAV1) || !isVP9orAV1;
+    }];
+    return [formats filteredArrayUsingPredicate:predicate];
 }
 
 static void hookFormatsBase(YTIHamplayerConfig *config) {
@@ -60,6 +84,40 @@ static void hookFormats(MLABRPolicy *self) {
 
 %end
 
+// Auto-reload stuck videos (from YTUHD 1.6.6)
+NSTimer *bufferingTimer = nil;
+
+%hook MLHAMQueuePlayer
+
+- (void)setState:(NSInteger)state {
+    %orig;
+    if (state == 5 || state == 6 || state == 8) {
+        if (bufferingTimer) {
+            [bufferingTimer invalidate];
+            bufferingTimer = nil;
+        }
+        __weak typeof(self) weakSelf = self;
+        bufferingTimer = [NSTimer scheduledTimerWithTimeInterval:2
+                            repeats:NO
+                            block:^(NSTimer *timer) {
+                                bufferingTimer = nil;
+                                __strong typeof(weakSelf) strongSelf = weakSelf;
+                                if (strongSelf) {
+                                    YTSingleVideoController *video = (YTSingleVideoController *)strongSelf.delegate;
+                                    YTLocalPlaybackController *playbackController = (YTLocalPlaybackController *)video.delegate;
+                                    [[%c(YTPlayerTapToRetryResponderEvent) eventWithFirstResponder:[playbackController parentResponder]] send];
+                                }
+                            }];
+    } else {
+        if (bufferingTimer) {
+            [bufferingTimer invalidate];
+            bufferingTimer = nil;
+        }
+    }
+}
+
+%end
+
 %hook MLHAMPlayerItem
 
 - (void)load {
@@ -101,11 +159,11 @@ static void hookFormats(MLABRPolicy *self) {
 %hook YTColdConfig
 
 - (BOOL)iosPlayerClientSharedConfigPopulateSwAv1MediaCapabilities {
-    return !AllVP9();
+    return YES;
 }
 
 - (BOOL)iosPlayerClientSharedConfigDisableLibvpxDecoder {
-    return NO; // 24.11.25 This won't work anymore with YouTube 20.47.3 and higher.
+    return NO;
 }
 
 %end
@@ -113,7 +171,7 @@ static void hookFormats(MLABRPolicy *self) {
 %hook YTHotConfig
 
 - (BOOL)iosPlayerClientSharedConfigDisableServerDrivenAbr {
-    return YES;
+    return DisableServerABR() ? YES : %orig;
 }
 
 - (BOOL)iosPlayerClientSharedConfigPostponeCabrPreferredFormatFiltering {
@@ -134,11 +192,27 @@ static void hookFormats(MLABRPolicy *self) {
 
 - (id)getSelectableFormatDataAndReturnError:(NSError **)error {
     [self setValue:@(NO) forKey:@"_postponePreferredFormatFiltering"];
+    // @try {
+    //     HAMDefaultABRPolicyConfig config = MSHookIvar<HAMDefaultABRPolicyConfig>(self, "_config");
+    //     config.softwareAV1Filter.maxArea = MAX_PIXELS;
+    //     config.softwareAV1Filter.maxFPS = MAX_FPS;
+    //     config.softwareVP9Filter.maxArea = MAX_PIXELS;
+    //     config.softwareVP9Filter.maxFPS = MAX_FPS;
+    //     MSHookIvar<HAMDefaultABRPolicyConfig>(self, "_config") = config;
+    // } @catch (id ex) {}
     return filteredFormats(%orig);
 }
 
 - (void)setFormats:(NSArray *)formats {
     [self setValue:@(YES) forKey:@"_postponePreferredFormatFiltering"];
+    // @try {
+    //     HAMDefaultABRPolicyConfig config = MSHookIvar<HAMDefaultABRPolicyConfig>(self, "_config");
+    //     config.softwareAV1Filter.maxArea = MAX_PIXELS;
+    //     config.softwareAV1Filter.maxFPS = MAX_FPS;
+    //     config.softwareVP9Filter.maxArea = MAX_PIXELS;
+    //     config.softwareVP9Filter.maxFPS = MAX_FPS;
+    //     MSHookIvar<HAMDefaultABRPolicyConfig>(self, "_config") = config;
+    // } @catch (id ex) {}
     %orig(filteredFormats(formats));
 }
 
@@ -155,11 +229,80 @@ static void hookFormats(MLABRPolicy *self) {
 
 %end
 
+BOOL overrideSupportsCodec = NO;
+
+%hook MLVideoDecoderFactory
+
+- (id)videoDecoderWithDelegate:(id)delegate delegateQueue:(id)delegateQueue formatDescription:(id)formatDescription pixelBufferAttributes:(id)pixelBufferAttributes preferredOutputFormats:(Span)preferredOutputFormats error:(NSError **)error {
+    HBLogDebug(@"YTUHD - MLVideoDecoderFactory videoDecoderWithDelegate called");
+    overrideSupportsCodec = YES;
+    id decoder = %orig;
+    overrideSupportsCodec = NO;
+    return decoder;
+}
+
+- (id)videoDecoderWithDelegate:(id)delegate delegateQueue:(id)delegateQueue formatDescription:(id)formatDescription pixelBufferAttributes:(id)pixelBufferAttributes setPixelBufferTypeOnlyIfEmpty:(BOOL)setPixelBufferTypeOnlyIfEmpty error:(NSError **)error {
+    HBLogDebug(@"YTUHD - MLVideoDecoderFactory videoDecoderWithDelegate called");
+    overrideSupportsCodec = YES;
+    id decoder = %orig;
+    overrideSupportsCodec = NO;
+    return decoder;
+}
+
+- (id)videoDecoderWithDelegate:(id)delegate delegateQueue:(id)delegateQueue formatDescription:(id)formatDescription pixelBufferAttributes:(id)pixelBufferAttributes error:(NSError **)error {
+    HBLogDebug(@"YTUHD - MLVideoDecoderFactory videoDecoderWithDelegate called");
+    overrideSupportsCodec = YES;
+    id decoder = %orig;
+    overrideSupportsCodec = NO;
+    return decoder;
+}
+
+%end
+
+%hook HAMDefaultVideoDecoderFactory
+
+- (id)videoDecoderWithDelegate:(id)delegate delegateQueue:(id)delegateQueue formatDescription:(id)formatDescription pixelBufferAttributes:(id)pixelBufferAttributes preferredOutputFormats:(Span)preferredOutputFormats error:(NSError **)error {
+    HBLogDebug(@"YTUHD - HAMDefaultVideoDecoderFactory videoDecoderWithDelegate called");
+    overrideSupportsCodec = YES;
+    id decoder = %orig;
+    overrideSupportsCodec = NO;
+    return decoder;
+}
+
+- (id)videoDecoderWithDelegate:(id)delegate delegateQueue:(id)delegateQueue formatDescription:(id)formatDescription pixelBufferAttributes:(id)pixelBufferAttributes setPixelBufferTypeOnlyIfEmpty:(BOOL)setPixelBufferTypeOnlyIfEmpty error:(NSError **)error {
+    HBLogDebug(@"YTUHD - HAMDefaultVideoDecoderFactory videoDecoderWithDelegate called");
+    overrideSupportsCodec = YES;
+    id decoder = %orig;
+    overrideSupportsCodec = NO;
+    return decoder;
+}
+
+- (id)videoDecoderWithDelegate:(id)delegate delegateQueue:(id)delegateQueue formatDescription:(id)formatDescription pixelBufferAttributes:(id)pixelBufferAttributes error:(NSError **)error {
+    HBLogDebug(@"YTUHD - HAMDefaultVideoDecoderFactory videoDecoderWithDelegate called");
+    overrideSupportsCodec = YES;
+    id decoder = %orig;
+    overrideSupportsCodec = NO;
+    return decoder;
+}
+
+%end
+
 %hook YTIIosOnesieHotConfig
 
 %new(B@:)
-- (BOOL)prepareVideoDecoder { 
-    return YES; 
+- (BOOL)prepareVideoDecoder { return YES; }
+
+%end
+
+%group Codec
+
+BOOL (*SupportsCodec)(CMVideoCodecType codec) = NULL;
+%hookf(BOOL, SupportsCodec, CMVideoCodecType codec) {
+    if (overrideSupportsCodec && (codec == kCMVideoCodecType_VP9 || codec == kCMVideoCodecType_AV1)) {
+        HBLogDebug(@"YTUHD - SupportsCodec called for codec: %d, returning NO", codec);
+        return NO;
+    }
+    return YES;
 }
 
 %end
@@ -204,8 +347,36 @@ static void hookFormats(MLABRPolicy *self) {
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         DecodeThreadsKey: @2
     }];
-    if (!UseVP9orAV1()) return;
+    if (!UseVP9()) return;
     %init;
+    uint8_t pattern1[] = {
+        0x28, 0x66, 0x8c, 0x52,
+        0xc8, 0x2e, 0xac, 0x72,
+        0x1f, 0x00, 0x08, 0x6b,
+        0x61, 0x00, 0x00, 0x54
+    };
+    uint8_t pattern2[] = {
+        0xf4, 0x4f, 0xbe, 0xa9,
+        0xfd, 0x7b, 0x01, 0xa9,
+        0xfd, 0x43, 0x00, 0x91,
+        0x28, 0x66, 0x8c, 0x52,
+        0xc8, 0x2e, 0xac, 0x72
+    };
+    NSString *bundlePath = [NSString stringWithFormat:@"%@/Frameworks/Module_Framework.framework", NSBundle.mainBundle.bundlePath];
+    NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
+    NSString *binary;
+    if (bundle) {
+        [bundle load];
+        binary = @"Module_Framework";
+    } else
+        binary = @"YouTube";
+    SupportsCodec = (BOOL (*)(CMVideoCodecType))libundirect_find(binary, pattern1, sizeof(pattern1), 0x28);
+    if (SupportsCodec == NULL)
+        SupportsCodec = (BOOL (*)(CMVideoCodecType))libundirect_find(binary, pattern2, sizeof(pattern2), 0xf4);
+    HBLogDebug(@"YTUHD: SupportsCodec: %d", SupportsCodec != NULL);
+    if (SupportsCodec) {
+        %init(Codec);
+    }
     if (!IS_IOS_OR_NEWER(iOS_15_0)) {
         %init(Spoofing);
     }
