@@ -13,6 +13,10 @@ extern "C" {
 }
 
 // Forward declarations for auto-reload
+@interface MLHAMQueuePlayer : NSObject
+@property (nonatomic, weak) id delegate;
+@end
+
 @interface YTSingleVideoController : NSObject
 @property (nonatomic, weak) id delegate;
 @end
