@@ -12,6 +12,20 @@ extern "C" {
     BOOL RowThreading();
 }
 
+// Forward declarations for auto-reload
+@interface YTSingleVideoController : NSObject
+@property (nonatomic, weak) id delegate;
+@end
+
+@interface YTLocalPlaybackController : NSObject
+- (id)parentResponder;
+@end
+
+@interface YTPlayerTapToRetryResponderEvent : NSObject
++ (instancetype)eventWithFirstResponder:(id)responder;
+- (void)send;
+@end
+
 NSArray <MLFormat *> *filteredFormats(NSArray <MLFormat *> *formats) {
     return formats;
 }
